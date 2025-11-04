@@ -1,0 +1,179 @@
+clc; clear; close all;
+
+%% System parameters
+BW = 1e6; % System bandwidth
+Noise_power = 10^((-173 - 30)/10)*BW; % Noise power
+Pathloss = @(x, y)( 10.^-(3.53 + 3.76.*log10(x) + y./10) ); % large-scale pathloss model
+% Pathloss = @(x)( 10.^-(3.53 + 3.76.*log10(x) ) ); % large-scale pathloss model
+K = 10; % Number of UEs
+M_H = 10; % Number of antenna per horizontal row
+M_V = 10; % Number of rows
+Mr = M_V * M_H; % Number of total antennas
+d_H = 1/2; % Horizontal antenna spacing
+d_V = 1/2; % Vertical antenna spacing
+rs = 50; % Scatter radii
+L = 2; % Pilot reuse factor/number of groups
+Nth = 200; % Channel uses
+Package_Meta = 12*8; % Metadata size in bits
+Package_Payload = 12*8; % Payload size in bits
+BLER_TH = logspace(-1, -8, 8); % Different BLER thresholds
+PtdBm = 30; % Transmit power in dBm
+Pt = 10^((PtdBm - 30)/10); % Transmit power in W
+Pp = Pt; % Pilot power in W
+r_inner = 30; % inner radii of UE range
+r_outer = 300; % outer radii of UE range
+
+MC = 1000; % The number of  repeat trials
+num = length(BLER_TH);
+NA_SE = zeros(num, 1);
+NA_JE = zeros(num, 1);
+NA_RS = zeros(num, 1);
+
+
+for mc = 1:MC
+    %% Generate UE locations
+    Shadowing = 10*randn(K, 1);
+    height_BS = 5 + 5*rand; % Height of BS
+    vertical_UE = 1 + 2.*rand(K, 1); % Height of UEs
+    horizontal_UE = r_inner + (r_outer - r_inner) * rand(K, 1); % Horizontal distance of UEs
+    height = height_BS - vertical_UE; % Elevation of UEs
+    phi = sort(2 * pi * rand(K, 1)); % Azimuth angle
+    UEposition = [horizontal_UE .* cos(phi), horizontal_UE .* sin(phi)]; % UE positions
+    dphi = atan(rs./horizontal_UE); % Horizontal angular spread
+    theta_max = atan(height./(max(horizontal_UE-rs,0)));
+    theta_min = atan(height./(horizontal_UE + rs));
+    theta = (theta_max + theta_min)/2; % Elevation angles
+    dtheta = (theta_max - theta_min)/2; % Vertical angular spread
+    dUE = sqrt(vertical_UE.^2 + horizontal_UE.^2); % Distance between UEs and antenna arrays
+    Beta = Pathloss(dUE, Shadowing); % large-scale pathloss
+
+    %% Generate corelation matrices
+    Rcorr = zeros(M_V*M_H, M_H*M_V, K);
+    for k = 1:K % Include pathloss
+        Rcorr(:, :, k) = Beta(k).*functionRlocalscattering3D(M_H, M_V, d_H, d_V, phi(k), dphi(k), theta(k), dtheta(k), 'Uniform');
+    end
+
+
+    %% Pilot Asignment
+    opts = statset('MaxIter', 500, 'Display', 'final'); % Kmeans cluster
+    [labels, centers] = kmeans(UEposition, L, ...
+        'Replicates', 10, ...
+        'Options', opts, ...
+        'Distance', 'sqeuclidean');
+    
+    [KL, ~] = histcounts(labels); % Number of users in each group
+
+    Rcorr_r = zeros(M_V*M_H, M_H*M_V, L, max(KL)); % correlation matrices after pilot reuse
+    Beta_r = zeros(L, max(KL)); % Large-scale pathloss after pilot reuse
+
+    for l = 1:L
+        group_users = find(labels == l);
+        if ~isempty(group_users)
+            Beta_r(l, 1:KL(l)) = Beta(group_users);
+            Rcorr_r(:, :, l, 1:KL(l)) = Rcorr(:, :, group_users);
+        end
+    end
+
+
+    %% Channel Estimation
+    tau_p = max(KL); % Length of the pilot sequence
+    h_true = sqrt(0.5).*randn(Mr, L, tau_p) + 1i*sqrt(0.5).*randn(Mr, L, tau_p); % True channel
+    h_est = zeros(Mr, L, tau_p); % Estimated channel
+
+    for l = 1:L
+        for kl = 1:tau_p
+            if kl <= KL(l)
+                Rsqrt = sqrtm(Rcorr_r(:, :, l, kl));
+                h_true(:, l, kl) = Rsqrt*h_true(:, l, kl); % Generate True channel
+            else
+                h_true(:, l, kl) = zeros(Mr, 1);
+            end
+        end
+    end
+
+    Np = sqrt(Noise_power/2)*randn(Mr, 1) + 1i*sqrt(Noise_power/2)*randn(Mr, 1); % Generate noise vector
+
+    Rcorr_est = zeros(Mr, Mr, L, tau_p); % Estimated channel correlation matrices
+    y = zeros(Mr, tau_p); % Post-processed pilot signal
+    for kl = 1:tau_p
+        for l = 1:L
+            y(:, kl) = y(:, kl) + sqrt(Pp*tau_p)*h_true(:, l, kl);
+        end
+        y(:, kl) = y(:, kl) + Np;
+    end
+    U = zeros(Mr, Mr, L, tau_p); % Auxiliary matrix
+    U_inv = zeros(Mr, Mr, L, tau_p); % Inv of the auxiliary matrix
+
+    for l = 1:L
+        for kl = 1:KL(l)
+            for l_pr = 1:L
+                for kl_pr = 1:KL(l)
+                    if kl_pr == kl
+                        U(:, :, l, kl) = U(:, :, l, kl) + Pp.*tau_p.*Rcorr_r(:, :, l_pr, kl_pr);
+                    end
+                end
+            end
+            U(:, :, l, kl) = U(:, :, l, kl) + Noise_power.*eye(Mr);
+            U_inv(:, :, l, kl) = inv(U(:, :, l, kl));
+            h_est(:, l, kl) = sqrt(Pp*tau_p)*Rcorr_r(:, :, l, kl)*U_inv(:, :, l, kl)*y(:, kl);
+            Rcorr_est(:, :, l, kl) = Pp.*tau_p.* Rcorr_r(:, :, l, kl) * U_inv(:, :, l, kl) * Rcorr_r(:, :, l, kl);
+        end
+    end
+
+    Rcorr_error = Rcorr_r - Rcorr_est; % Estimation error
+
+    H_est = zeros(Mr, K);
+    group_counters = zeros(L, 1);
+    for k = 1:K
+        current_group = labels(k);
+        group_counters(current_group) = group_counters(current_group) + 1;
+        H_est(:, k) = h_est(:, current_group, group_counters(current_group));
+    end
+
+    V_ZF = H_est / (H_est'*H_est); % ZF Detector
+    for kl = 1:K
+        V_ZF(:, kl) = V_ZF(:, kl)./norm(V_ZF(:, kl));
+    end
+    V_ZF_r = zeros(Mr, L, tau_p); % ZF detector after pilot reuse
+    for l = 1:L
+        group_users = find(labels == l);
+        if ~isempty(group_users)
+            V_ZF_r(:, l, 1:KL(l)) = V_ZF(:, group_users);
+        end
+    end
+
+    %% Compute a series of auxiliary variables
+    akl = zeros(L, tau_p, L, tau_p);
+    ckl = zeros(L, tau_p, L, tau_p);
+
+    for l = 1:L % compute
+        for kl = 1:KL(l)
+            for l_pr = 1:L
+                for kl_pr = 1:KL(l_pr)
+                    akl(l_pr, kl_pr, l, kl) = abs(V_ZF_r(:, l, kl)'*h_est(:, l_pr, kl_pr))^2;
+                    ckl(l_pr, kl_pr, l, kl) = abs(V_ZF_r(:, l, kl)'*Rcorr_error(:, :, l_pr, kl_pr)*V_ZF_r(:, l, kl));
+                end
+            end
+        end
+    end
+
+    %% Power Allocation
+    Nd = Nth - tau_p;
+    R_Meta = Package_Meta/Nd; % Coding rate for Metadata in bpcu
+    R_Payload = Package_Payload/Nd; % Coding rate for Payload in bpcu
+    R_JE = (Package_Payload + Package_Meta)/Nd; % Coding rate for whole package in bpcu
+
+    for num_ = 1:num
+        NA_SE(num_) = NA_SE(num_) + Power_Allocation_SE_ZF_MRC(BLER_TH(num_), Nd, L, KL, tau_p, Package_Meta, Package_Payload, Pt, Noise_power, akl, ckl);
+        NA_JE(num_) = NA_JE(num_) + Power_Allocation_JE_ZF_MRC(BLER_TH(num_), Nd, R_JE, L, KL, tau_p, Pt, Noise_power, akl, ckl);
+        NA_RS(num_) = NA_RS(num_) + Power_Allocation_RS_ZF_MRC(BLER_TH(num_), Nd, R_Meta, R_Payload, L, KL, tau_p, Pt, Noise_power, akl, ckl);
+    end
+
+    clc
+    fprintf('this is the %d iteration \n', mc)
+end
+NA_SE_ZF = NA_SE./MC;
+NA_JE_ZF = NA_JE./MC;
+NA_RS_ZF = NA_RS./MC;
+
+save("Data\NA_VS_BLER_TH_ZF.mat", "NA_JE_ZF", "NA_SE_ZF", "NA_RS_ZF")
